@@ -1,0 +1,213 @@
+defaults:
+  - _self_
+hydra:
+  run:
+    dir: ${logdir}
+  job:
+    chdir: false
+_target_: agent.finetune.train_distill_residual_flow_sia_agent.TrainDistillResidualFlowSiaAgent
+
+name: ${env_name}_ft_distill_residual_flow_sia_img_ta${horizon_steps}_ds${diffusion_steps}
+logdir: log_dir/robomimic-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+
+# ── SIA BC checkpoint ─────────────────────────────────────────────────────
+# Update this path to point to your trained SIA BC checkpoint
+base_policy_path: checkpoints/lbm_bc_lift/best.pt
+
+# ── Environment ───────────────────────────────────────────────────────────
+robomimic_env_cfg_path: cfg/robomimic/env_meta/lift-sia-img.json
+# normalization_path is auto-generated from the SIA checkpoint's norm_stats
+normalization_path: null
+
+seed: 42
+device: cuda:0
+env_name: lift
+run_eval: true
+
+# ── Dimensions (state_dim only; augmented by agent with CLIP features) ────
+obs_dim: 9
+action_dim: 7
+use_6d_rot: false
+abs_action: false
+
+# ── SIA DiT inference settings ────────────────────────────────────────────
+diffusion_steps: 5
+task_prompt: "lift the cube"
+sia_root: null  # Set to path of sia repo if not auto-detected
+
+# ── Action chunking (matching dice-rl defaults) ──────────────────────────
+cond_steps: 1
+img_cond_steps: 1
+horizon_steps: 4
+act_steps: 4
+noise_dim: 28  # action_dim * horizon_steps = 7 * 4
+
+env:
+  n_envs: 8
+  name: ${env_name}
+  best_reward_threshold_for_success: 1
+  max_episode_steps: 400
+  save_video: False
+  use_image_obs: true
+  specific:
+    abs_action: ${abs_action}
+    use_6d_rot: ${use_6d_rot}
+  wrappers:
+    robomimic_image:
+      normalization_path: ${normalization_path}
+      success_steps_before_termination: 1
+      image_keys: [
+                   'agentview_image',
+                   'robot0_eye_in_hand_image'
+                   ]
+      low_dim_keys: ['robot0_eef_pos',
+                    'robot0_eef_quat',
+                    'robot0_gripper_qpos']
+      shape_meta: ${shape_meta}
+      use_6d_rot: ${use_6d_rot}
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${act_steps}
+      max_episode_steps: ${env.max_episode_steps}
+      reset_within_step: True
+      gamma: ${train.gamma}
+
+# ── Shape metadata ────────────────────────────────────────────────────────
+shape_meta:
+  obs:
+    rgb:
+      shape: [96, 96, 6]  # 2 cameras × 3 RGB channels
+    state:
+      shape: [9]
+  action:
+    shape: [7]
+
+# ── WandB ─────────────────────────────────────────────────────────────────
+wandb:
+  entity: null
+  project: robomimic-${env_name}-distill-residual-flow-sia-img
+  run: ${now:%Y-%m-%d_%H-%M-%S_%f}_${name}
+
+# ── Training hyperparameters (matching dice-rl image configs exactly) ─────
+train:
+  num_train_steps: 150000
+  val_freq: 10
+  n_steps: 100
+  n_train_itr: 1000
+  batch_size: 256
+  eval_freq: 1000
+  gamma: 0.99
+  tau: 0.01
+  update_freq: 1
+  gradient_steps: 20
+  # Learning rates
+  actor_lr: 1e-4
+  critic_lr: 1e-4
+  # Weight decay
+  actor_weight_decay: 1e-5
+  critic_weight_decay: 1e-5
+  # Learning rate scheduler
+  use_lr_scheduler: True
+  lr_scheduler:
+    first_cycle_steps: 1000
+    warmup_steps: 10
+    min_lr: 1e-6
+  # Target networks
+  actor_update_freq: 2
+  critic_target_update_freq: 2
+  save_model_freq: 100
+  render:
+    freq: 1
+    num: 0
+  log_freq: 1
+  max_grad_norm: 1.0
+
+# ── Replay buffer ─────────────────────────────────────────────────────────
+replay_buffer:
+  max_size: 2000000
+  use_n_step: true
+  n_step: 3
+  expert_use_n_step: ${expert_dataset.use_n_step}
+  expert_n_step: ${expert_dataset.n_step}
+
+# ── RLPD ──────────────────────────────────────────────────────────────────
+use_rlpd: true
+expert_ratio: 0.3
+use_adaptive_expert_ratio: true
+adaptive_expert_ratio_start: 0.5
+adaptive_expert_ratio_end: 0.1
+adaptive_expert_ratio_steps: 10000
+
+# ── Model (SIA variant of DistillResidualRLImgModel) ─────────────────────
+model:
+  _target_: model.rl.distill_residual_rl_sia.DistillResidualRLSiaModel
+  obs_dim: ${obs_dim}  # Will be augmented by agent
+  action_dim: ${action_dim}
+  noise_dim: ${noise_dim}
+  cond_steps: ${cond_steps}
+  horizon_steps: ${horizon_steps}
+  device: ${device}
+  # SIA-specific parameters
+  task_prompt: ${task_prompt}
+  diffusion_steps: ${diffusion_steps}
+  sia_root: ${sia_root}
+  # Residual conditioning
+  condition_residual_on_base_action: false
+  num_multi_z_for_actor_loss: 16
+  # N-step returns
+  use_n_step: ${replay_buffer.use_n_step}
+  n_step: ${replay_buffer.n_step}
+  # Pretrained policy path
+  pretrained_flow_policy_path: ${base_policy_path}
+  # Network configurations
+  actor_hidden_dims: [1024, 1024, 1024]
+  critic_hidden_dims: [1024, 1024, 1024]
+  activation_type: "GELU"
+  use_layernorm: true
+  # Loss coefficients
+  bc_loss_weight: 50.0
+  critic_weight: 1.0
+  use_soft_q_filtering: false
+  q_filtering_warmup_steps: 3000
+  q_underestimation_threshold: -0.25
+  replay_flow_warmup_steps: 3000
+  # Q normalization
+  use_q_normalization: true
+  # Expert data handling
+  disable_q_loss_for_expert_data: true
+  always_retain_bc_loss_for_expert_data: true
+  # Multi-sample noise
+  multi_sample_next_noise: true
+  num_next_noise_samples: 4
+  # Critic ensemble
+  critic_ensemble_size: 10
+
+# ── Expert dataset ────────────────────────────────────────────────────────
+expert_dataset:
+  _target_: agent.dataset.sequence.StitchedSequenceQLearningDataset
+  dataset_path: data_dir/robomimic/${env_name}-img/ph_finetune/train.npz
+  horizon_steps: ${horizon_steps}
+  cond_steps: ${cond_steps}
+  img_cond_steps: ${img_cond_steps}
+  device: ${device}
+  discount_factor: ${train.gamma}
+  gamma: ${train.gamma}
+  max_n_episodes: 50
+  use_img: true
+  success_steps_for_termination: ${env.wrappers.robomimic_image.success_steps_before_termination}
+  use_n_step: true
+  n_step: 3
+  use_6d_rot: ${use_6d_rot}
+  abs_action: ${abs_action}
+
+# ── Evaluation & exploration ──────────────────────────────────────────────
+visualize_trajectories: false
+visualization_freq: 200000000
+num_eval_episodes: 30
+eval_n_envs: 10
+
+log_q_overestimation: true
+
+online_explore_strategy: "max_q_min"
+evaluate_strategy: "max_q_min"
+num_exploration_samples: 16
