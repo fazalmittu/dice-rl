@@ -18,21 +18,23 @@ The pipeline we built does:
 
 ### 1.2 The two codebases
 
-Both repos live side-by-side on disk:
+Both repos live **side-by-side under the same parent directory** on disk:
 
 ```
-/Users/fazal/Desktop/dice-rl    # DICE-RL (this repo)
-/Users/fazal/Desktop/sia        # SIA repo (read-only reference, imported from)
+<root>/dice-rl    # DICE-RL (this repo)
+<root>/sia        # SIA repo (read-only reference, imported from)
 ```
+
+Where `<root>` is whatever parent you place them under. The wrapper computes the SIA path relative to its own file location (`../../../sia` from `dice-rl/model/rl/sia_policy_wrapper.py`), so as long as the two repos share a parent directory the imports resolve automatically. You can override this via the `sia_root:` field in the YAML config if you ever need to.
 
 - **dice-rl** is a fork of `real-stanford/dice-rl`. Origin remote points to upstream; the personal fork is at `fazalmittu/dice-rl`. Our work lives on the `sia-integration` branch, which we push to the fork remote named `fazal`.
 - **sia** is read-only from our perspective. We import a couple of modules from it (`models.lbm`, `models.transforms`) at runtime via `sys.path` manipulation.
 
-### 1.3 Important non-goals and constraints
+### 1.3 Important context and constraints
 
-- **No GPU access during development.** All code was written but never actually trained or run end-to-end. Expect bugs when you first hit CUDA.
+- **This machine has a GPU.** All development up to this point was done on a GPU-less machine — code was written but never actually trained or run end-to-end. You are the first to run it on real hardware. Expect to hit CUDA-specific bugs (dtype issues, OOM, etc.) that we couldn't catch in static review.
 - **No expert dataset downloaded yet.** The expert data path in the config points at a file that doesn't exist locally.
-- **No trained SIA BC checkpoint yet.** The user will train one separately; our config expects it at `checkpoints/lbm_bc_lift/best.pt`.
+- **No trained SIA BC checkpoint yet.** A checkpoint must be trained in SIA separately; our config expects it at `checkpoints/lbm_bc_lift/best.pt` (inside the dice-rl repo, configurable).
 
 ---
 
@@ -80,7 +82,7 @@ Where `Ĝ(s)` is a Monte Carlo return estimate computed from the replay buffer, 
 
 ### 2.2 The SIA DiT BC policy
 
-Located at `/Users/fazal/Desktop/sia`. The relevant class is `DiTPolicy` in `models/lbm.py`.
+Located in the sibling `sia/` directory. The relevant class is `DiTPolicy` in `models/lbm.py`.
 
 **Architecture** (for `dit_B` preset — the default):
 - Backbone: Diffusion Transformer with 12 layers × 384 hidden × 6 heads
@@ -205,7 +207,7 @@ Other methods on the wrapper:
 - `visual_feature_dim` property returns `num_cameras * clip_dim`
 - `get_normalization_arrays()` converts SIA z-score `norm_stats` into `{obs_min, obs_max, action_min, action_max}` arrays — used by the agent to write the normalization.npz
 
-**Import handling**: the wrapper adds `/Users/fazal/Desktop/sia` to `sys.path` (computed relative to its own file location) before importing `from models.lbm import DiTPolicy` and `from models.transforms import resize_with_pad_torch`. The agent/config also expose a `sia_root` kwarg to override this if the sia repo lives elsewhere.
+**Import handling**: the wrapper adds the sibling `sia/` directory to `sys.path` (computed as `../../../sia` relative to its own file location — i.e. it assumes `dice-rl/` and `sia/` share a parent directory) before importing `from models.lbm import DiTPolicy` and `from models.transforms import resize_with_pad_torch`. The agent/config also expose a `sia_root` kwarg to override this if the sia repo lives elsewhere.
 
 **Freezes everything on load**: sets all params to `requires_grad=False` and calls `.eval()`. The DICE-RL training loop never updates the DiT weights.
 
@@ -352,11 +354,9 @@ Same as DICE-RL's `lift-img.json` with one change: `camera_names` now has both `
 
 ### 6.1 Prerequisites
 
-On whatever machine you're on:
-
-1. **Clone both repos side-by-side**:
+1. **Clone both repos side-by-side** under a shared parent directory:
    ```bash
-   cd ~/Desktop     # or wherever; the wrapper infers ../sia from its own path
+   cd <parent>     # the wrapper resolves ../sia from dice-rl's location
    git clone git@github.com:fazalmittu/dice-rl.git
    cd dice-rl && git checkout sia-integration
    cd ..
@@ -371,14 +371,14 @@ On whatever machine you're on:
 
 ### 6.2 Launch command
 
+From the dice-rl repo root:
 ```bash
-cd /Users/fazal/Desktop/dice-rl
 python script/run.py \
     --config-path ../cfg/robomimic/finetune/lift \
     --config-name ft_distill_residual_flow_sia_img
 ```
 
-Or from the repo root, however DICE-RL's hydra entry point expects you to invoke it — check `script/run.py` to confirm.
+Check `script/run.py` to confirm the exact hydra entry-point invocation expected by this fork.
 
 ### 6.3 What to watch in the logs
 
@@ -398,9 +398,9 @@ Or from the repo root, however DICE-RL's hydra entry point expects you to invoke
 5. **Import error from `models.lbm`**: the SIA repo isn't at the expected relative path. Set `sia_root:` explicitly in the YAML config.
 6. **Frozen DiT model outputs are the wrong dtype**: the DiT's internal dtype (set by `x_embedder.weight.dtype`) may be bf16 or fp16 when loaded on GPU. The wrapper converts inputs appropriately, but if you see dtype errors in `denoise_step`, that's where to look.
 
-### 6.5 Verifying correctness (no-GPU smoke test)
+### 6.5 Pre-flight smoke tests (no-GPU)
 
-We already did the following; confirm they still pass after a clone:
+These catch basic problems before you burn GPU time. Run from the dice-rl repo root:
 
 ```bash
 # 1. Syntactic compilation of all new files
@@ -416,9 +416,17 @@ python -c "import json; json.load(open('cfg/robomimic/env_meta/lift-sia-img.json
 python -c "
 import os
 sia_root = os.path.normpath(os.path.join('model/rl', '..', '..', '..', 'sia'))
-assert os.path.exists(os.path.join(sia_root, 'models', 'lbm.py'))
+assert os.path.exists(os.path.join(sia_root, 'models', 'lbm.py')), f'sia not found at {sia_root}'
 print('SIA path OK:', sia_root)
 "
+```
+
+Additionally, with the environment activated (on the GPU machine), verify that the imports actually succeed:
+
+```bash
+python -c "from model.rl.sia_policy_wrapper import SIAPolicyWrapper; print('import OK')"
+python -c "from model.rl.distill_residual_rl_sia import DistillResidualRLSiaModel; print('import OK')"
+python -c "from agent.finetune.train_distill_residual_flow_sia_agent import TrainDistillResidualFlowSiaAgent; print('import OK')"
 ```
 
 ---
@@ -450,7 +458,7 @@ git fetch origin    # optional, to track upstream
 
 ## 8. Known gaps and pending work
 
-1. **Nothing has actually been run end-to-end.** All code was written on a machine without GPU access. Expect bugs on first execution.
+1. **Nothing has actually been run end-to-end.** All code was written on a machine without GPU access — this repo on this branch is reaching real hardware for the first time. Expect bugs on first execution (most likely categories: CUDA dtype mismatches in `denoise_step`, OOM from the 10-critic ensemble + 16-sample exploration stack, and shape edge-cases in `extract_visual_features` if the env wrapper stacks cameras differently than assumed).
 
 2. **We only have a config for Lift.** The plan is to support four tasks: `Lift`, `Can`, `ToolHang`, and a bimanual task (`TwoArmTransport` or `TwoArmBoxCleanup`). Each needs:
    - A per-task config YAML (copy `ft_distill_residual_flow_sia_img.yaml` and change `env_name`, `base_policy_path`, `task_prompt`, camera keys, `max_episode_steps`)
@@ -495,7 +503,7 @@ dice-rl/
 │       └── ft_distill_residual_flow_sia_img.yaml # OURS
 └── util/hybrid_replay_buffer.py                  # upstream, unchanged
 
-sia/                                              # separate repo, not modified
+../sia/                                           # sibling repo, not modified
 ├── models/
 │   ├── lbm.py                                    # DiTPolicy class (imported)
 │   ├── transforms.py                             # resize_with_pad_torch (imported)
